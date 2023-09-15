@@ -1,0 +1,8 @@
+.idea
+.env
+
+*.log
+*.txt
+
+vendor
+logs

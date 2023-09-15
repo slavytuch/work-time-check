@@ -1,0 +1,12 @@
+{
+    "require": {
+        "bugrov/yandex-tracker": "dev-master",
+        "nesbot/carbon": "^2.70",
+        "vlucas/phpdotenv": "^5.5"
+    },
+    "autoload": {
+        "psr-4": {
+            "Slavytuch\\WorkTimeCheck\\": "./lib"
+        }
+    }
+}
