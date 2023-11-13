@@ -6,6 +6,7 @@ use BugrovWeb\YandexTracker\Api\Tracker;
 use BugrovWeb\YandexTracker\Exceptions\TrackerBadMethodException;
 use BugrovWeb\YandexTracker\Exceptions\TrackerBadParamsException;
 use BugrovWeb\YandexTracker\Exceptions\TrackerBadResponseException;
+use Carbon\Carbon;
 use DateInterval;
 use DateTime;
 use Exception;
@@ -30,7 +31,7 @@ class Loader
 
     /**
      * @param DateTime $from
-     * @return Array<TrackerEntryDTO>
+     * @return array
      * @throws TrackerBadMethodException
      * @throws TrackerBadParamsException
      * @throws TrackerBadResponseException
@@ -43,9 +44,11 @@ class Loader
         ])->send()->getResponse();
         $trackerEntries = [];
         foreach ($dateEntries as $entry) {
-            $trackerEntries[] = new TrackerEntryDTO(
+            $createdAt = date('j.m', strtotime($entry['createdAt']));
+            $trackerEntries[$createdAt][] = new TrackerEntryDTO(
                 task: $entry['issue']['key'],
-                time: new DateInterval(preg_replace('/\.[0-9]+/', '', $entry['duration']))
+                time: new DateInterval(preg_replace('/\.[0-9]+/', '', $entry['duration'])),
+                date: $createdAt
             );
         }
 
@@ -54,11 +57,14 @@ class Loader
 
     /**
      * @param DateTime $from
-     * @return Array<MyEntryDTO>
+     * @return array
      * @throws Exception
      */
     protected function getMyEntries(\DateTime $from)
     {
+        if ($from->diff(Carbon::now())->invert) {
+            throw new Exception('Передаваемая дата больше текущей');
+        }
         $myFile = fopen('рабочее время.txt', 'r');
 
         if (!$myFile) {
@@ -76,7 +82,7 @@ class Loader
             }
 
             if ($row === $start . PHP_EOL) {
-                $date = $start;
+                $date = trim($start);
                 $startFound = true;
                 continue;
             }
@@ -87,7 +93,8 @@ class Loader
 
             $parts = explode(' - ', $row);
             if (count($parts) < 3) {
-                $date = $parts[0];
+                $date = trim($parts[0]);
+
                 continue;
             }
 
@@ -95,17 +102,24 @@ class Loader
 
             $message = str_replace(PHP_EOL, '', $message);
 
-            if ($message === 'нераспред') {
-                $message = 'INT-718';
-            } elseif ($message === 'обед') {
+            if ($message === 'обед') {
                 continue;
             }
 
-            $myEntries[] = new MyEntryDTO(
-                message: $message,
+            if ($message === 'нераспред') {
+                $message = 'INT-718';
+            }
+
+            $myEntries[$date][] = new MyEntryDTO(
+                task: $message,
                 time: (new DateTime($timeStart))->diff(new DateTime($timeEnd)),
                 date: $date
             );
+        }
+
+        if (!$startFound) {
+            $from->add(DateInterval::createFromDateString('1 day'));
+            return $this->getMyEntries($from);
         }
 
         return $myEntries;
@@ -117,44 +131,86 @@ class Loader
 
         $myEntries = $this->getMyEntries($from);
         $trackerEntries = $this->getTrackerEntries($from);
+        $result = [];
 
-        $sums = ['diff' => [], 'missing' => []];
-        foreach ($myEntries as $myEntry) {
-            $entryFound = false;
-            foreach ($trackerEntries as $key => $trackerEntry) {
-                if ($trackerEntry->task === $myEntry->message) {
-                    $entryFound = true;
-                    unset($trackerEntries[$key]);
-
-                    $difference = $this->minutes($trackerEntry->time) - $this->minutes($myEntry->time);
-
-                    if (abs($difference) <= 3) {
-                        break;
-                    }
-
-                    if (!isset($sums['diff'][$myEntry->date][$myEntry->message])) {
-                        $sums['diff'][$myEntry->date][$myEntry->message] = 0;
-                    }
-
-                    $sums['diff'][$myEntry->date][$myEntry->message] += $difference;
-
-                    break;
-                }
+        foreach (array_merge(array_keys($myEntries), array_keys($trackerEntries)) as $date) {
+            if(!isset($myEntries[$date])) {
+                $result[$date] = [
+                    'missingInFile' => $this->sumOfEntries($trackerEntries[$date]),
+                    'missingInTracker' => [],
+                    'timeDifference' => [],
+                ];
+                continue;
             }
 
-            if (!$entryFound && $this->minutes($myEntry->time) > 3) {
-                if (!isset($sums['missing'][$myEntry->date][$myEntry->message])) {
-                    $sums['missing'][$myEntry->date][$myEntry->message] = 0;
-                }
-                $sums['missing'][$myEntry->date][$myEntry->message] += $this->minutes($myEntry->time);
+            $myTodayEntries = $this->sumOfEntries($myEntries[$date]);
+            if(!isset($trackerEntries[$date])) {
+                $result[$date] = [
+                    'missingInFile' => [],
+                    'missingInTracker' => $myTodayEntries,
+                    'timeDifference' => [],
+                ];
+                continue;
             }
+
+            $trackerTodayEntries = $this->sumOfEntries($trackerEntries[$date]);
+
+            $missingInTracker = array_diff(array_keys($myTodayEntries), array_keys($trackerTodayEntries));
+
+            $missingInTrackerResult = [];
+            foreach ($missingInTracker as $key) {
+                $missingInTrackerResult[$key] = $myTodayEntries[$key];
+            }
+
+            $missingInFile = array_diff(array_keys($trackerTodayEntries), array_keys($myTodayEntries));
+
+            $missingInFileResult = [];
+            foreach ($missingInFile as $key) {
+                $missingInFileResult[$key] = $trackerTodayEntries[$key];
+            }
+
+            $timeDifference = [];
+
+            foreach ($myTodayEntries as $task => $myTodayEntry) {
+                if(in_array($task, $missingInFile) || in_array($task, $missingInTracker)) {
+                    continue;
+                }
+
+                $difference = $myTodayEntry - $trackerTodayEntries[$task];
+
+                if($difference < 3) {
+                    continue;
+                }
+
+                $timeDifference[$task] = $myTodayEntry - $trackerTodayEntries[$task];
+            }
+
+            $result[$date] = [
+                'missingInFile' => $missingInFileResult,
+                'missingInTracker' => $missingInTrackerResult,
+                'timeDifference' => $timeDifference,
+            ];
         }
 
-        return $sums;
+        return $result;
     }
 
     protected function minutes(DateInterval $interval)
     {
         return $interval->i + 60 * $interval->h;
+    }
+
+    protected function sumOfEntries(array $entries)
+    {
+        $result = [];
+        foreach ($entries as $entry) {
+            if(!isset($result[$entry->task])) {
+                $result[$entry->task] = 0;
+            }
+
+            $result[$entry->task] += $this->minutes($entry->time);
+        }
+
+        return $result;
     }
 }
